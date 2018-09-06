@@ -1,0 +1,288 @@
+program uModPluginUpdater;
+
+{$APPTYPE CONSOLE}
+{$R *.res}
+
+uses
+  System.SysUtils,
+  System.Classes,
+  System.StrUtils,
+  System.IOUtils,
+  System.Types,
+  IdIOHandler,
+  IdIOHandlerSocket,
+  IdIOHandlerStack,
+  IdCookieManager,
+  IdSSL,
+  IdSSLOpenSSL,
+  IdBaseComponent,
+  IdComponent,
+  IdTCPConnection,
+  IdTCPClient,
+  IdHTTP,
+  Math,
+  uConsts in 'uConsts.pas',
+  djson in 'djson.pas';
+
+type
+  TPluginInfo = record
+    Name: string;
+    Author: string;
+    Version: string;
+    filename: string;
+    Debug: string;
+  end;
+
+var
+  arrPlugins: array of string;
+  arrPluginVersions: array of Integer;
+  dynPlugins: TStringDynArray;
+  arrNotUpdated: array of string;
+
+function ExtractFileNameEX(const AFileName: string): string;
+var
+  I: Integer;
+begin
+  I := LastDelimiter('.' + PathDelim + DriveDelim, AFileName);
+  if (I = 0) or (AFileName[I] <> '.') then
+    I := MaxInt;
+  Result := ExtractFileName(Copy(AFileName, 1, I - 1));
+end;
+
+function FindTextBetweenTags(const aText, aTagLeft, aTagRight: string): string;
+var
+  sdata: TStringList;
+  iLeft, iRight: Integer;
+begin
+  sdata := TStringList.Create;
+  try
+    sdata.Text := aText;
+
+    iLeft := Pos(aTagLeft, sdata.Text) + Length(aTagLeft);
+    iRight := Pos(aTagRight, sdata.Text);
+
+    Result := Copy(sdata.Text, iLeft, iRight - iLeft);
+  finally
+    FreeAndNil(sdata);
+  end;
+end;
+
+function GetPluginInfo(const AFileName: string): TPluginInfo;
+var
+  sdata, sinfo: TStringList;
+  I: Integer;
+  sline: string;
+begin
+  Result.filename := AFileName;
+
+  if ExtractFileExt(AFileName) = '.cs' then
+  begin
+    sdata := TStringList.Create;
+    try
+      sdata.LoadFromFile(AFileName);
+
+      for I := 0 to sdata.Count - 1 do
+      begin
+        if AnsiContainsStr(sdata[I], 'Info') then
+        begin
+          sline := sdata[I];
+          Break;
+        end;
+      end;
+
+      sline := FindTextBetweenTags(sline, '(', ')');
+
+      sinfo := TStringList.Create;
+      try
+        sinfo.Delimiter := ',';
+        sinfo.QuoteChar := '"';
+        sinfo.DelimitedText := sline;
+
+        Result.Debug := sline;
+        Result.Name := sinfo[0];
+        Result.Author := sinfo[1];
+        Result.Version := sinfo[2];
+      finally
+        sinfo.Free;
+      end;
+    finally
+      sdata.Free;
+    end;
+  end;
+end;
+
+function CanConnect(const aHost: string; const aPort: Integer): Boolean;
+var
+  tcp: TIdTCPClient;
+begin
+  tcp := TIdTCPClient.Create(nil);
+  try
+    Sleep(2000);
+    tcp.Host := aHost;
+    tcp.Port := aPort;
+    tcp.ConnectTimeout := 500;
+    tcp.Connect;
+    Result := True;
+    tcp.Disconnect;
+    tcp.Free;
+  except
+    on E: Exception do
+    begin
+      Result := False;
+    end;
+  end;
+end;
+
+procedure CheckForUpdates;
+var
+  http: TIdHTTP;
+  ssl: TIdSSLIOHandlerSocketOpenSSL;
+  Stream: TMemoryStream;
+  I, iplugins, iLatestVersion, iUpdated: Integer;
+  jdata, jplugin: TdJSON;
+  pluginInfo: TPluginInfo;
+  bUpdated: Boolean;
+begin
+  iplugins := 0;
+  iUpdated := 0;
+  Writeln('Loading Plugins...');
+  Writeln('');
+  dynPlugins := TDirectory.GetFiles(APP_DIR, '*.cs');
+
+  if Length(dynPlugins) <= 0 then
+  begin
+    Writeln('No plugins could be found.');
+    Writeln('');
+    Writeln('Press any key to exit.');
+    Readln;
+    Exit;
+  end;
+
+  SetLength(arrPlugins, Length(dynPlugins));
+  SetLength(arrPluginVersions, Length(dynPlugins));
+  SetLength(arrNotUpdated, Length(dynPlugins));
+
+  for I := 0 to Length(dynPlugins) - 1 do
+  begin
+    pluginInfo := GetPluginInfo(dynPlugins[I]);
+
+    arrPlugins[I] := pluginInfo.Name;
+    arrPluginVersions[I] := StrToInt(AnsiReplaceStr(pluginInfo.Version, '.', ''));
+
+    Writeln('Found Plugin: ' + pluginInfo.Name);
+    Sleep(100);
+  end;
+  Writeln('');
+  Writeln('Total Plugins: ' + IntToStr(Length(arrPlugins)));
+  Writeln('');
+
+  Writeln('Checking for updates...');
+
+  http := TIdHTTP.Create(nil);
+  try
+    ssl := TIdSSLIOHandlerSocketOpenSSL.Create(nil);
+    try
+      ssl.SSLOptions.SSLVersions := [sslvTLSv1, sslvTLSv1_1, sslvTLSv1_2];
+      http.IOHandler := ssl;
+      http.HandleRedirects := True;
+      http.Request.UserAgent := 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:61.0) Gecko/20100101 Firefox/61.0';
+
+      for I := 0 to Length(arrPlugins) - 1 do
+      begin
+        bUpdated := False;
+        jdata := TdJSON.Parse(http.Get('https://umod.org/plugins/search.json?query=' + ExtractFileNameEX(dynPlugins[I])));
+        try
+          if http.Request.RawHeaders.Values['X-RateLimit-Remaining'] = '2' then
+          begin
+            Writeln('uMod Rate Limit has been hit! Waiting 1 minute before continuing...');
+            Sleep(60000);
+          end;
+          for jplugin in jdata['data'] do
+          begin
+            if jplugin['name'].AsString = ExtractFileNameEX(dynPlugins[I]) then
+            begin
+              Stream := TMemoryStream.Create;
+              try
+                Writeln('Found Plugin: "' + arrPlugins[I] + '" on uMod.org');
+                Inc(iplugins);
+                Writeln('Checking ' + arrPlugins[I] + ' for updates...');
+
+                iLatestVersion := StrToInt(AnsiReplaceStr(jplugin['latest_release_version'].AsString, '.', ''));
+
+                if iLatestVersion <> arrPluginVersions[I] then
+                begin
+                  Writeln(arrPlugins[I] + ' is outdated! Updating...');
+                  http.Get(jplugin['download_url'].AsString, Stream);
+                  Stream.SaveToFile(dynPlugins[I]);
+                  Inc(iUpdated);
+                end
+                else
+                  Writeln(arrPlugins[I] + ' is up to date!');
+
+                Writeln('');
+
+                bUpdated := True;
+              finally
+                Stream.Free;
+              end;
+            end;
+          end;
+        finally
+          jdata.Free;
+        end;
+        if not bUpdated then
+          arrNotUpdated[I] := ExtractFileNameEX(dynPlugins[I]);
+      end;
+
+    finally
+      ssl.Free;
+    end;
+  finally
+    http.Free;
+  end;
+
+  Writeln('=================================================');
+  Writeln('The following plugins couldn''t be updated as they were not found on uMod.org. They might get added later so keep trying everyday :)');
+  Writeln('');
+  for I := 0 to Length(arrNotUpdated) - 1 do
+  begin
+    if arrNotUpdated[I] <> '' then
+      Writeln(arrNotUpdated[I]);
+  end;
+  Writeln('=================================================');
+  Writeln('');
+  Writeln('Total plugins found on uMod.org: ' + IntToStr(iplugins) + ' of ' + IntToStr(Length(dynPlugins)) + ' installed.');
+  Writeln('Total plugins updated: ' + IntToStr(iUpdated));
+  Writeln('');
+  Writeln('Press any key to exit.');
+  Readln;
+end;
+
+begin
+  try
+    Writeln('Quantum''s Experimental uMod plugin updater');
+    Writeln('');
+    Writeln('Checking connection to uMod.org...');
+    Writeln('');
+    Write('Connecting... ');
+    if CanConnect('umod.org', 80) then
+    begin
+      Write('OK!');
+      Writeln('');
+      Writeln('');
+      CheckForUpdates;
+    end
+    else
+    begin
+      Write('FAILED!');
+      Writeln('');
+      Writeln(ANY_KEY_TO_EXIT);
+      Readln;
+    end;
+  except
+    on E: Exception do
+      Writeln(E.ClassName, ': ', E.Message);
+  end;
+
+end.
+

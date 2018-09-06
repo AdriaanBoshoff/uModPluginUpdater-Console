@@ -1,0 +1,14 @@
+unit uConsts;
+
+interface
+
+const
+  ANY_KEY_TO_EXIT = 'Press any key to exit';
+
+{$IFDEF MSWINDOWS}
+
+{$ENDIF}
+
+implementation
+
+end.
